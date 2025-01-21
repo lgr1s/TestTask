@@ -3,6 +3,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <mutex>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -15,8 +16,9 @@ static const int WORKER_THREAD_COUNT = 4;
 static const int BUFFER_SIZE = 4096;
 
 //logging
+std::mutex g_logMutex;
 void Log(const std::string& msg) {
-
+	std::lock_guard<std::mutex> lk(g_logMutex);
 	std::cout << msg << std::endl;
 }
 
@@ -127,6 +129,16 @@ bool Receive(IO_CONTEXT& ctx) {
 	return true;
 }
 
+void CloseConnection(CONNECTION_CONTEXT* connCont)
+{
+	connCont->closed = true;
+	shutdown(connCont->ClientSocket, SD_BOTH);
+	closesocket(connCont->ClientSocket);
+	shutdown(connCont->ServerSocket, SD_BOTH);
+	closesocket(connCont->ServerSocket);
+	delete connCont;
+}
+
 void WorkerThread() {
 
 	while (true) {
@@ -152,12 +164,16 @@ void WorkerThread() {
 			InitializeContext(servWrite, IOOperationType::WriteServer, connCont->ServerSocket);
 			std::memcpy(servWrite.buffer, IOCont->buffer, bytesTransferred);
 
-			Send(servWrite, servWrite.buffer, bytesTransferred);
-			InitializeContext(connCont->ClientReadContext, IOOperationType::ReadClient, connCont->ClientSocket);
-			Receive(connCont->ClientReadContext);
-			break;
+			if (!Send(servWrite, servWrite.buffer, bytesTransferred)) {
+				CloseConnection(connCont);
+
+			}
 		}
 		case IOOperationType::WriteClient: {
+			InitializeContext(connCont->ClientReadContext, IOOperationType::ReadClient, connCont->ClientSocket);
+			if (!Receive(connCont->ClientReadContext)) {
+				CloseConnection(connCont);
+			}
 			break;
 		}
 		case IOOperationType::ReadServer: {
@@ -167,13 +183,17 @@ void WorkerThread() {
 			InitializeContext(clientWrite, IOOperationType::WriteClient, connCont->ClientSocket);
 			std::memcpy(clientWrite.buffer, IOCont->buffer, bytesTransferred);
 
-			Send(clientWrite, clientWrite.buffer, bytesTransferred);
-			InitializeContext(connCont->ServerReadContext, IOOperationType::ReadServer, connCont->ServerSocket);
-			Receive(connCont->ServerReadContext);
+			if (!Send(clientWrite, clientWrite.buffer, bytesTransferred)) {
+				CloseConnection(connCont);
+			}
+			break;
 		}
 		case IOOperationType::WriteServer: {
 			InitializeContext(connCont->ServerReadContext, IOOperationType::ReadServer, connCont->ServerSocket);
-			Receive(connCont->ServerReadContext);
+			if (!Receive(connCont->ServerReadContext)) {
+				CloseConnection(connCont);
+			}
+			break;
 		}
 		default:
 			break;
@@ -184,6 +204,10 @@ void WorkerThread() {
 SOCKET ServerConnection(const char* host, int port) {
 
 	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (s == INVALID_SOCKET) {
+		Log("Socket creation failed");
+		return INVALID_SOCKET;
+	}
 
 	sockaddr_in serverAddr;
 	serverAddr.sin_family = AF_INET;
@@ -211,14 +235,25 @@ bool StartProxyServer() {
 	}
 
 	SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (listenSock == INVALID_SOCKET) {
+		Log("Socket has failed!");
+		return false;
+	}
 
 	sockaddr_in localAddr;
 	localAddr.sin_family = AF_INET;
 	localAddr.sin_addr.s_addr = htonl(INADDR_ANY);
 	localAddr.sin_port = htons(LISTEN_PORT);
 
-	bind(listenSock, (sockaddr*)&localAddr, sizeof(localAddr));
-	listen(listenSock, SOMAXCONN);
+	if (bind(listenSock, (sockaddr*)&localAddr, sizeof(localAddr)) == SOCKET_ERROR) {
+		Log("Bind has failed!");
+		closesocket(listenSock);
+		return false;
+	}
+	if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR) {
+		Log("Listen has failed!");
+		return false;
+	}
 	Log("Proxy listening on port " + std::to_string(LISTEN_PORT));
 
 	while (true) {
@@ -240,20 +275,34 @@ bool StartProxyServer() {
 			}
 		}
 		SOCKET serverSock = ServerConnection(SERVER_HOST, SERVER_PORT);
+		if (serverSock == INVALID_SOCKET)
+		{
+			Log("Server Connection has failed!");
+			closesocket(clientSock);
+			continue;
+		}
 		CONNECTION_CONTEXT* connCont = new CONNECTION_CONTEXT();
 		connCont->ClientSocket = clientSock;
 		connCont->ServerSocket = serverSock;
 
-		SocketToCP(clientSock, (ULONG_PTR)connCont);
-		SocketToCP(serverSock, (ULONG_PTR)connCont);
+		if (!SocketToCP(clientSock, (ULONG_PTR)connCont) || !SocketToCP(serverSock, (ULONG_PTR)connCont)) {
+			Log("Associating socket with IOCP has faied!");
+			CloseConnection(connCont);
+		}
 
 		InitializeContext(connCont->ClientReadContext, IOOperationType::ReadClient, clientSock);
 		InitializeContext(connCont->ClientWriteContext, IOOperationType::WriteClient, clientSock);
 		InitializeContext(connCont->ServerReadContext, IOOperationType::ReadServer, serverSock);
 		InitializeContext(connCont->ServerWriteContext, IOOperationType::WriteServer, serverSock);
 
-		Receive(connCont->ClientReadContext);
-		Receive(connCont->ServerReadContext);
+		if (!Receive(connCont->ClientReadContext)) {
+			CloseConnection(connCont);
+			continue;
+		}
+		if (!Receive(connCont->ServerReadContext)) {
+			CloseConnection(connCont);
+			continue;
+		}
 
 		//log connection
 		char ip[INET_ADDRSTRLEN] = { 0 };
@@ -261,6 +310,7 @@ bool StartProxyServer() {
 		Log(std::string("Client connection: ") + ip);
 
 	}
+	closesocket(listenSock);
 	return true;
 }
 
@@ -273,4 +323,6 @@ int main() {
 		return 1;
 	}
 	StartProxyServer();
+	WSACleanup();
+	return 0;
 }
