@@ -7,13 +7,13 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-static const int LISTEN_PORT = 3307;
-static const int SERVER_PORT = 3306;
+static constexpr int LISTEN_PORT = 3309;
+static constexpr int SERVER_PORT = 3306;
 static const char* SERVER_HOST = "127.0.0.1";
 
-static const int WORKER_THREAD_COUNT = 4;
+static constexpr int WORKER_THREAD_COUNT = 4;
 
-static const int BUFFER_SIZE = 4096;
+static constexpr int BUFFER_SIZE = 4096;
 
 //logging
 std::mutex g_logMutex;
@@ -131,12 +131,20 @@ bool Receive(IO_CONTEXT& ctx) {
 
 void CloseConnection(CONNECTION_CONTEXT* connCont)
 {
-	connCont->closed = true;
-	shutdown(connCont->ClientSocket, SD_BOTH);
-	closesocket(connCont->ClientSocket);
-	shutdown(connCont->ServerSocket, SD_BOTH);
-	closesocket(connCont->ServerSocket);
-	delete connCont;
+	if (!connCont->closed) {
+
+		connCont->closed = true;
+
+		shutdown(connCont->ClientSocket, SD_BOTH);
+		closesocket(connCont->ClientSocket);
+		connCont->ClientSocket = INVALID_SOCKET;
+		
+		shutdown(connCont->ServerSocket, SD_BOTH);
+		closesocket(connCont->ServerSocket);
+		connCont->ServerSocket = INVALID_SOCKET;
+		
+		delete connCont;
+	}
 }
 
 void WorkerThread() {
@@ -146,10 +154,12 @@ void WorkerThread() {
 		ULONG_PTR completionKey = 0;
 		LPOVERLAPPED overlapped = nullptr;
 
-		GetQueuedCompletionStatus(CompletionPort, &bytesTransferred, &completionKey, &overlapped, INFINITE);
+		bool statusOK = GetQueuedCompletionStatus(CompletionPort, &bytesTransferred, &completionKey, &overlapped, INFINITE);
 
 		CONNECTION_CONTEXT* connCont = reinterpret_cast<CONNECTION_CONTEXT*>(completionKey);
-		IO_CONTEXT* IOCont = reinterpret_cast<IO_CONTEXT*>(overlapped);
+		IO_CONTEXT* IOCont = reinterpret_cast<IO_CONTEXT*>(overlapped); // IO_CONTEXT address correlates with LPOVERLAPPED as Overlapped is the fires field in the IO_CONEXT structure
+
+
 
 		IOCont->TransferredData = bytesTransferred;
 
@@ -166,12 +176,12 @@ void WorkerThread() {
 
 			if (!Send(servWrite, servWrite.buffer, bytesTransferred)) {
 				CloseConnection(connCont);
-
-			}
+			}			
+			break;
 		}
-		case IOOperationType::WriteClient: {
-			InitializeContext(connCont->ClientReadContext, IOOperationType::ReadClient, connCont->ClientSocket);
-			if (!Receive(connCont->ClientReadContext)) {
+		case IOOperationType::WriteServer: {
+			InitializeContext(connCont->ServerReadContext, IOOperationType::ReadServer, connCont->ServerSocket);
+			if (!Receive(connCont->ServerReadContext)) {
 				CloseConnection(connCont);
 			}
 			break;
@@ -186,15 +196,18 @@ void WorkerThread() {
 			if (!Send(clientWrite, clientWrite.buffer, bytesTransferred)) {
 				CloseConnection(connCont);
 			}
+			InitializeContext(connCont->ServerReadContext, IOOperationType::ReadServer, connCont->ServerSocket);
+			Receive(connCont->ServerReadContext);
 			break;
 		}
-		case IOOperationType::WriteServer: {
-			InitializeContext(connCont->ServerReadContext, IOOperationType::ReadServer, connCont->ServerSocket);
-			if (!Receive(connCont->ServerReadContext)) {
+		case IOOperationType::WriteClient: {
+			InitializeContext(connCont->ClientReadContext, IOOperationType::ReadClient, connCont->ClientSocket);
+			if (!Receive(connCont->ClientReadContext)) {
 				CloseConnection(connCont);
 			}
 			break;
 		}
+
 		default:
 			break;
 		}
