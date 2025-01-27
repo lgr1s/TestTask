@@ -4,6 +4,7 @@
 #include <string>
 #include <thread>
 #include <mutex>
+#include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -20,24 +21,6 @@ std::mutex g_logMutex;
 void Log(const std::string& msg) {
 	std::lock_guard<std::mutex> lk(g_logMutex);
 	std::cout << msg << std::endl;
-}
-
-//Parser
-std::string ParseQuery(const char* data, int len) {
-	//4th byte - type of request
-	//5th byte - request
-	if (len < 5) return "";
-
-	unsigned int packetLen = (static_cast<unsigned char>(data[0])) |
-		(static_cast<unsigned char>(data[1]) << 8) |
-		(static_cast<unsigned char>(data[2]) << 16);
-
-	unsigned char command = static_cast<unsigned char>(data[4]);
-	if (command != 0x03) return ""; //COM_QUERY
-
-	int queryLen = packetLen - 1;
-
-	return std::string(data + 5, queryLen);
 }
 
 enum class IOOperationType {
@@ -69,6 +52,9 @@ struct CONNECTION_CONTEXT {
 	IO_CONTEXT ServerWriteContext;
 
 	bool closed = false;
+
+	std::vector<char> clientBuff;
+	std::vector<char> serverBuff;
 };
 
 //IOCP obj
@@ -146,6 +132,63 @@ void CloseConnection(CONNECTION_CONTEXT* connCont)
 		delete connCont;
 	}
 }
+
+static const size_t MySqlHeaderSize = 4; // 3 bytes of len, 1 byte of seq
+//Parser
+
+void SendToServer(CONNECTION_CONTEXT* connCont, std::vector<char>& packet) {
+
+	IO_CONTEXT& sw = connCont->ServerWriteContext;
+	InitializeContext(sw, IOOperationType::WriteServer, connCont->ServerSocket);
+
+	memcpy(sw.buffer, packet.data(), packet.size());
+	Send(sw, sw.buffer, static_cast<int>(packet.size()));
+
+}
+
+void ProcessClientBuffer(CONNECTION_CONTEXT* connCont) {
+
+	auto& data = connCont->clientBuff;
+	while (true) {
+		if (data.size() < MySqlHeaderSize) return;
+	}
+	unsigned int packetLen = (static_cast<unsigned char>(data[0])) |
+		(static_cast<unsigned char>(data[1]) << 8) |
+		(static_cast<unsigned char>(data[2]) << 16);
+
+	unsigned int totalLen = MySqlHeaderSize + packetLen;
+	if (data.size() < totalLen) {
+		return; //Packet is not full. Waiting for the rest
+	}
+
+	std::vector<char> packet(data.begin(), data.begin() + totalLen);
+	if (packet.size() >= 5) {
+		unsigned char command = static_cast<unsigned char>(packet[4]);
+		if (command == 0x03) {
+			unsigned int sqlLen = packetLen - 1;
+			if (sqlLen > 0 && (MySqlHeaderSize + 1 + sqlLen) <= packet.size()) {
+				std::string sql(packet.data() + 5, packet.data() + 5 + sqlLen);
+			}
+		}
+	}
+}
+
+/*std::string ParseQuery(const char* data, int len) {
+	//4th byte - type of request
+	//5th byte - request
+	if (len < 5) return "";
+
+	unsigned int packetLen = (static_cast<unsigned char>(data[0])) |
+		(static_cast<unsigned char>(data[1]) << 8) |
+		(static_cast<unsigned char>(data[2]) << 16);
+
+	unsigned char command = static_cast<unsigned char>(data[4]);
+	if (command != 0x03) return ""; //COM_QUERY
+
+	int queryLen = packetLen - 1;
+
+	return std::string(data + 5, queryLen);
+}*/
 
 void WorkerThread() {
 
