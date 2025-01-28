@@ -138,11 +138,11 @@ static const size_t MySqlHeaderSize = 4; // 3 bytes of len, 1 byte of seq
 
 void SendToServer(CONNECTION_CONTEXT* connCont, std::vector<char>& packet) {
 
-	IO_CONTEXT& sw = connCont->ServerWriteContext;
-	InitializeContext(sw, IOOperationType::WriteServer, connCont->ServerSocket);
+	IO_CONTEXT& serverWrite = connCont->ServerWriteContext;
+	InitializeContext(serverWrite, IOOperationType::WriteServer, connCont->ServerSocket);
 
-	memcpy(sw.buffer, packet.data(), packet.size());
-	Send(sw, sw.buffer, static_cast<int>(packet.size()));
+	memcpy(serverWrite.buffer, packet.data(), packet.size());
+	Send(serverWrite, serverWrite.buffer, static_cast<int>(packet.size()));
 
 }
 
@@ -151,25 +151,58 @@ void ProcessClientBuffer(CONNECTION_CONTEXT* connCont) {
 	auto& data = connCont->clientBuff;
 	while (true) {
 		if (data.size() < MySqlHeaderSize) return;
-	}
-	unsigned int packetLen = (static_cast<unsigned char>(data[0])) |
-		(static_cast<unsigned char>(data[1]) << 8) |
-		(static_cast<unsigned char>(data[2]) << 16);
+		unsigned int packetLen = (static_cast<unsigned char>(data[0])) |
+			(static_cast<unsigned char>(data[1]) << 8) |
+			(static_cast<unsigned char>(data[2]) << 16);
 
-	unsigned int totalLen = MySqlHeaderSize + packetLen;
-	if (data.size() < totalLen) {
-		return; //Packet is not full. Waiting for the rest
-	}
+		unsigned int totalLen = MySqlHeaderSize + packetLen;
+		if (data.size() < totalLen) {
+			return; //Packet is not full. Waiting for the rest
+		}
 
-	std::vector<char> packet(data.begin(), data.begin() + totalLen);
-	if (packet.size() >= 5) {
-		unsigned char command = static_cast<unsigned char>(packet[4]);
-		if (command == 0x03) {
-			unsigned int sqlLen = packetLen - 1;
-			if (sqlLen > 0 && (MySqlHeaderSize + 1 + sqlLen) <= packet.size()) {
-				std::string sql(packet.data() + 5, packet.data() + 5 + sqlLen);
+		std::vector<char> packet(data.begin(), data.begin() + totalLen);
+		if (packet.size() >= 5) {
+			unsigned char command = static_cast<unsigned char>(packet[4]);
+			if (command == 0x03) {
+				unsigned int sqlLen = packetLen - 1;
+				if (sqlLen > 0 && (MySqlHeaderSize + 1 + sqlLen) <= packet.size()) {
+					std::string sql(packet.data() + 5, packet.data() + 5 + sqlLen);
+				}
 			}
 		}
+		SendToServer(connCont, packet);
+		data.erase(data.begin(), data.begin() + totalLen);
+	}
+}
+
+void SendToClient(CONNECTION_CONTEXT* connCont, std::vector<char>& packet) {
+
+	IO_CONTEXT& clientWrite = connCont->ClientWriteContext;
+	InitializeContext(clientWrite, IOOperationType::WriteClient, connCont->ClientSocket);
+
+	memcpy(clientWrite.buffer, packet.data(), packet.size());
+	Send(clientWrite, clientWrite.buffer, static_cast<int>(packet.size()));
+
+}
+
+void ProcessServerBuffer(CONNECTION_CONTEXT* connCont) {
+
+	auto& data = connCont->serverBuff;
+	while (true) {
+		if (data.size() < MySqlHeaderSize) return;
+		unsigned int packetLen = (static_cast<unsigned char>(data[0])) |
+			(static_cast<unsigned char>(data[1]) << 8) |
+			(static_cast<unsigned char>(data[2]) << 16);
+
+		unsigned int totalLen = MySqlHeaderSize + packetLen;
+		if (data.size() < totalLen) {
+			return; //Packet is not full. Waiting for the rest
+		}
+
+		std::vector<char> packet(data.begin(), data.begin() + totalLen);
+
+		SendToClient(connCont, packet);
+		data.erase(data.begin(), data.begin() + totalLen);
 	}
 }
 
@@ -210,8 +243,8 @@ void WorkerThread() {
 
 		case IOOperationType::ReadClient: {
 
-			std::string query = ParseQuery(IOCont->buffer, IOCont->TransferredData);
-			if (!query.empty()) Log("SQL Query: " + query);
+			connCont->clientBuff.insert(connCont->clientBuff.end(), IOCont->buffer, IOCont->buffer + bytesTransferred);
+			ProcessClientBuffer(connCont);
 
 			IO_CONTEXT& servWrite = connCont->ServerWriteContext;
 			InitializeContext(servWrite, IOOperationType::WriteServer, connCont->ServerSocket);
@@ -232,13 +265,8 @@ void WorkerThread() {
 		case IOOperationType::ReadServer: {
 
 			//resend server response to client
-			IO_CONTEXT& clientWrite = connCont->ClientWriteContext;
-			InitializeContext(clientWrite, IOOperationType::WriteClient, connCont->ClientSocket);
-			std::memcpy(clientWrite.buffer, IOCont->buffer, bytesTransferred);
-
-			if (!Send(clientWrite, clientWrite.buffer, bytesTransferred)) {
-				CloseConnection(connCont);
-			}
+			connCont->serverBuff.insert(connCont->serverBuff.end(), IOCont->buffer, IOCont->buffer + bytesTransferred);
+			ProcessServerBuffer(connCont);
 			InitializeContext(connCont->ServerReadContext, IOOperationType::ReadServer, connCont->ServerSocket);
 			Receive(connCont->ServerReadContext);
 			break;
