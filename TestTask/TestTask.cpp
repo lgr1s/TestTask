@@ -126,11 +126,11 @@ void CloseConnection(CONNECTION_CONTEXT* connCont)
 		shutdown(connCont->ClientSocket, SD_BOTH);
 		closesocket(connCont->ClientSocket);
 		connCont->ClientSocket = INVALID_SOCKET;
-		
+
 		shutdown(connCont->ServerSocket, SD_BOTH);
 		closesocket(connCont->ServerSocket);
 		connCont->ServerSocket = INVALID_SOCKET;
-		
+
 		delete connCont;
 	}
 }
@@ -235,16 +235,12 @@ void WorkerThread() {
 		ULONG_PTR completionKey = 0;
 		LPOVERLAPPED overlapped = nullptr;
 
-		bool statusOK = GetQueuedCompletionStatus(CompletionPort, &bytesTransferred, &completionKey, &overlapped, INFINITE);
+		GetQueuedCompletionStatus(CompletionPort, &bytesTransferred, &completionKey, &overlapped, INFINITE);
 
 		CONNECTION_CONTEXT* connCont = reinterpret_cast<CONNECTION_CONTEXT*>(completionKey);
 		IO_CONTEXT* IOCont = reinterpret_cast<IO_CONTEXT*>(overlapped); // IO_CONTEXT address correlates with LPOVERLAPPED as Overlapped is the fires field in the IO_CONEXT structure
 
-		if (!statusOK or bytesTransferred == 0) {
-			if (completionKey) {
-				CloseConnection(connCont);
-			}
-		}
+
 
 		IOCont->TransferredData = bytesTransferred;
 
@@ -254,7 +250,7 @@ void WorkerThread() {
 
 			connCont->clientBuff.insert(connCont->clientBuff.end(), IOCont->buffer, IOCont->buffer + bytesTransferred);
 			ProcessClientBuffer(connCont);
-			
+
 			InitializeContext(connCont->ClientReadContext, IOOperationType::ReadClient, connCont->ClientSocket);
 
 			Receive(connCont->ClientReadContext);
