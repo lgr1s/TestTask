@@ -8,12 +8,13 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-static constexpr int LISTEN_PORT = 3309;
+static constexpr int LISTEN_PORT = 3307;
 static constexpr int SERVER_PORT = 3306;
 static const char* SERVER_HOST = "127.0.0.1";
 
 static constexpr int WORKER_THREAD_COUNT = 4;
 
+//Overlapped buffer size for a single call of WSASend/WSARecv
 static constexpr int BUFFER_SIZE = 4096;
 
 //logging
@@ -42,6 +43,7 @@ struct IO_CONTEXT {
 	DWORD TransferredData;
 };
 
+//Context of a single connection
 struct CONNECTION_CONTEXT {
 	SOCKET ClientSocket = INVALID_SOCKET;
 	SOCKET ServerSocket = INVALID_SOCKET;
@@ -134,16 +136,17 @@ void CloseConnection(CONNECTION_CONTEXT* connCont)
 }
 
 static const size_t MySqlHeaderSize = 4; // 3 bytes of len, 1 byte of seq
-//Parser
 
+//Parser
 void SendToServer(CONNECTION_CONTEXT* connCont, std::vector<char>& packet) {
 
 	IO_CONTEXT& serverWrite = connCont->ServerWriteContext;
 	InitializeContext(serverWrite, IOOperationType::WriteServer, connCont->ServerSocket);
 
 	memcpy(serverWrite.buffer, packet.data(), packet.size());
-	Send(serverWrite, serverWrite.buffer, static_cast<int>(packet.size()));
-
+	if (!Send(serverWrite, serverWrite.buffer, static_cast<int>(packet.size()))) {
+		CloseConnection(connCont);
+	}
 }
 
 void ProcessClientBuffer(CONNECTION_CONTEXT* connCont) {
@@ -167,6 +170,7 @@ void ProcessClientBuffer(CONNECTION_CONTEXT* connCont) {
 				unsigned int sqlLen = packetLen - 1;
 				if (sqlLen > 0 && (MySqlHeaderSize + 1 + sqlLen) <= packet.size()) {
 					std::string sql(packet.data() + 5, packet.data() + 5 + sqlLen);
+					Log("SQL Query: " + sql);
 				}
 			}
 		}
@@ -181,8 +185,9 @@ void SendToClient(CONNECTION_CONTEXT* connCont, std::vector<char>& packet) {
 	InitializeContext(clientWrite, IOOperationType::WriteClient, connCont->ClientSocket);
 
 	memcpy(clientWrite.buffer, packet.data(), packet.size());
-	Send(clientWrite, clientWrite.buffer, static_cast<int>(packet.size()));
-
+	if (!Send(clientWrite, clientWrite.buffer, static_cast<int>(packet.size()))) {
+		CloseConnection(connCont);
+	}
 }
 
 void ProcessServerBuffer(CONNECTION_CONTEXT* connCont) {
@@ -235,7 +240,11 @@ void WorkerThread() {
 		CONNECTION_CONTEXT* connCont = reinterpret_cast<CONNECTION_CONTEXT*>(completionKey);
 		IO_CONTEXT* IOCont = reinterpret_cast<IO_CONTEXT*>(overlapped); // IO_CONTEXT address correlates with LPOVERLAPPED as Overlapped is the fires field in the IO_CONEXT structure
 
-
+		if (!statusOK or bytesTransferred == 0) {
+			if (completionKey) {
+				CloseConnection(connCont);
+			}
+		}
 
 		IOCont->TransferredData = bytesTransferred;
 
@@ -245,21 +254,13 @@ void WorkerThread() {
 
 			connCont->clientBuff.insert(connCont->clientBuff.end(), IOCont->buffer, IOCont->buffer + bytesTransferred);
 			ProcessClientBuffer(connCont);
+			
+			InitializeContext(connCont->ClientReadContext, IOOperationType::ReadClient, connCont->ClientSocket);
 
-			IO_CONTEXT& servWrite = connCont->ServerWriteContext;
-			InitializeContext(servWrite, IOOperationType::WriteServer, connCont->ServerSocket);
-			std::memcpy(servWrite.buffer, IOCont->buffer, bytesTransferred);
-
-			if (!Send(servWrite, servWrite.buffer, bytesTransferred)) {
-				CloseConnection(connCont);
-			}			
+			Receive(connCont->ClientReadContext);
 			break;
 		}
 		case IOOperationType::WriteServer: {
-			InitializeContext(connCont->ServerReadContext, IOOperationType::ReadServer, connCont->ServerSocket);
-			if (!Receive(connCont->ServerReadContext)) {
-				CloseConnection(connCont);
-			}
 			break;
 		}
 		case IOOperationType::ReadServer: {
@@ -272,10 +273,6 @@ void WorkerThread() {
 			break;
 		}
 		case IOOperationType::WriteClient: {
-			InitializeContext(connCont->ClientReadContext, IOOperationType::ReadClient, connCont->ClientSocket);
-			if (!Receive(connCont->ClientReadContext)) {
-				CloseConnection(connCont);
-			}
 			break;
 		}
 
